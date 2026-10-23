@@ -340,6 +340,7 @@ export const ChatHistory = ({ tabId }: ChatHistoryProps): JSX.Element => {
 
   // Track shouldDisableAutoScroll transitions for scroll restore coordination
   const prevShouldDisableRef = useRef(shouldDisableAutoScroll);
+  const skipNextRestoreRef = useRef(false);
 
   const { registerAIGroupRef } = useVisibleAIGroup({
     onVisibleChange: (aiGroupId) => {
@@ -672,6 +673,7 @@ export const ChatHistory = ({ tabId }: ChatHistoryProps): JSX.Element => {
 
     // If this tab just became inactive, save its scroll position
     if (wasActive && !isThisTabActive) {
+      skipNextRestoreRef.current = false;
       const container = scrollContainerRef.current;
       const hasValidLayout = container !== null && container.clientHeight > 0;
       const scrollTop = hasValidLayout ? container.scrollTop : (lastScrollTopRef.current ?? 0);
@@ -711,12 +713,22 @@ export const ChatHistory = ({ tabId }: ChatHistoryProps): JSX.Element => {
       const isBottom = hasValidLayout
         ? isNearBottom(container.scrollTop, container.scrollHeight, container.clientHeight, SCROLL_THRESHOLD)
         : wasAtBottomRef.current;
+      skipNextRestoreRef.current = true;
       saveScrollPosition(scrollTop, isBottom);
       return;
     }
 
+    if (!isThisTabActive) {
+      skipNextRestoreRef.current = false;
+      return;
+    }
+
+    if (skipNextRestoreRef.current) {
+      skipNextRestoreRef.current = false;
+      return;
+    }
+
     if (
-      isThisTabActive &&
       scrollContainerRef.current &&
       !conversationLoading &&
       !shouldDisableAutoScroll
