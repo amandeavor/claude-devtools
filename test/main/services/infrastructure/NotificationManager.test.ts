@@ -14,7 +14,7 @@ vi.mock('@shared/utils/logger', () => ({
 
 vi.mock('electron', () => ({
   Notification: class MockNotification {
-    static isSupported = vi.fn().mockReturnValue(true);
+    static readonly isSupported = vi.fn().mockReturnValue(true);
     show = vi.fn();
     on = vi.fn();
   },

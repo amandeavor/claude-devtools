@@ -680,9 +680,13 @@ export class FileWatcher extends EventEmitter {
 
         if (isFirstObservation) {
           // If first time observing an existing session file that was not seeded,
-          // ignore historical messages that occurred before the watcher started.
+          // ignore historical messages that occurred before the watcher started
+          // or entries lacking an explicit raw timestamp (which default to now).
           newMessages = newMessages.filter(
-            (msg) => msg.timestamp && msg.timestamp.getTime() >= this.watcherStartTime
+            (msg) =>
+              msg.hasRawTimestamp !== false &&
+              msg.timestamp &&
+              msg.timestamp.getTime() >= this.watcherStartTime
           );
         }
       }
@@ -894,13 +898,10 @@ export class FileWatcher extends EventEmitter {
               const stats = await this.fsProvider.stat(fullPath);
               if (now - stats.mtimeMs <= CATCH_UP_MAX_AGE_MS) {
                 const sessionId = path.basename(entry.name, '.jsonl');
-                this.activeSessionFiles.set(fullPath, {
+                await this.seedSessionFile(fullPath, stats.size, {
                   projectId: dir.name,
                   sessionId,
                 });
-                this.lastProcessedSize.set(fullPath, stats.size);
-                const messages = await parseJsonlFile(fullPath, this.fsProvider);
-                this.lastProcessedLineCount.set(fullPath, messages.length);
               }
             } catch {
               continue;
@@ -918,15 +919,14 @@ export class FileWatcher extends EventEmitter {
                   try {
                     const subStats = await this.fsProvider.stat(subFullPath);
                     if (now - subStats.mtimeMs <= CATCH_UP_MAX_AGE_MS) {
-                      const subagentId = path.basename(subEntry.name, '.jsonl').replace(/^agent-/, '');
-                      this.activeSessionFiles.set(subFullPath, {
+                      const subagentId = path
+                        .basename(subEntry.name, '.jsonl')
+                        .replace(/^agent-/, '');
+                      await this.seedSessionFile(subFullPath, subStats.size, {
                         projectId: dir.name,
                         sessionId: entry.name,
                         subagentId,
                       });
-                      this.lastProcessedSize.set(subFullPath, subStats.size);
-                      const subMessages = await parseJsonlFile(subFullPath, this.fsProvider);
-                      this.lastProcessedLineCount.set(subFullPath, subMessages.length);
                     }
                   } catch {
                     continue;
@@ -945,6 +945,60 @@ export class FileWatcher extends EventEmitter {
       }
     } catch (err) {
       logger.error('Error seeding active session files:', err);
+    }
+  }
+
+  /**
+   * Seeds a single session or subagent file without clobbering live watcher offsets
+   * or suppressing messages written at or after watcherStartTime.
+   */
+  private async seedSessionFile(
+    fullPath: string,
+    initialSize: number,
+    info: { projectId: string; sessionId: string; subagentId?: string }
+  ): Promise<void> {
+    if (info.subagentId) {
+      const config = ConfigManager.getInstance().getConfig();
+      if (!config.notifications.includeSubagentErrors) {
+        return;
+      }
+    }
+
+    this.activeSessionFiles.set(fullPath, info);
+
+    // Do not clobber offsets if live watcher events already processed or are processing this file
+    if (this.lastProcessedLineCount.has(fullPath) || this.processingInProgress.has(fullPath)) {
+      return;
+    }
+
+    const messages = await parseJsonlFile(fullPath, this.fsProvider);
+
+    // Re-check after async parse in case a live watcher event processed the file concurrently
+    if (this.lastProcessedLineCount.has(fullPath) || this.processingInProgress.has(fullPath)) {
+      return;
+    }
+
+    const firstPostStartIdx = messages.findIndex(
+      (msg) =>
+        msg.hasRawTimestamp !== false &&
+        msg.timestamp &&
+        msg.timestamp.getTime() >= this.watcherStartTime
+    );
+
+    if (firstPostStartIdx === -1) {
+      this.lastProcessedSize.set(fullPath, initialSize);
+      this.lastProcessedLineCount.set(fullPath, messages.length);
+    } else {
+      // File contains messages written at or after watcherStartTime; baseline only historical lines
+      // and trigger error detection for post-start lines.
+      this.lastProcessedLineCount.set(fullPath, firstPostStartIdx);
+      this.lastProcessedSize.set(fullPath, 0);
+      await this.detectErrorsInSessionFile(
+        info.projectId,
+        info.sessionId,
+        fullPath,
+        info.subagentId
+      );
     }
   }
 
@@ -979,8 +1033,14 @@ export class FileWatcher extends EventEmitter {
     }
 
     const now = Date.now();
+    const includeSubagentErrors =
+      ConfigManager.getInstance().getConfig().notifications.includeSubagentErrors;
 
     for (const [filePath, info] of this.activeSessionFiles) {
+      if (info.subagentId && !includeSubagentErrors) {
+        continue;
+      }
+
       try {
         const stats = await this.fsProvider.stat(filePath);
 
